@@ -81,15 +81,29 @@ static void *xmp_init(struct fuse_conn_info *conn,
 	return NULL;
 }
 
+static int is_hidden_name(const char *path);
+static int marked(const char *path, const char *marker);
+
 static int xmp_getattr(const char *path, struct stat *stbuf,
 		       struct fuse_file_info *fi)
 {
 	(void) fi;
 	int res;
 
+	/* slow-getattr in the directory: a getattr of a hidden name takes 1 s */
+	if (is_hidden_name(path) && marked(path, "slow-getattr"))
+		usleep(1000000);
+
 	res = lstat(path, stbuf);
 	if (res == -1)
 		return -errno;
+
+	/*
+	 * same-ino in the directory: every file answers inode number 1, as on
+	 * a filesystem that gives a removed file's number to the next file
+	 */
+	if (S_ISREG(stbuf->st_mode) && marked(path, "same-ino"))
+		stbuf->st_ino = 1;
 
 	return 0;
 }
@@ -208,23 +222,156 @@ static int xmp_symlink(const char *from, const char *to)
 	return 0;
 }
 
+/*
+ * Failure injection for the hidden file tests (not for upstream): a marker
+ * file in the directory of the path turns on a failure.
+ */
+static int ends_with(const char *s, const char *end)
+{
+	size_t n = strlen(s), m = strlen(end);
+
+	return n >= m && !strcmp(s + n - m, end);
+}
+
+/*
+ * the path's last component starts with .fuse_ (a hidden name); a NULL path
+ * (a node libfuse no longer names, without nullpath_ok) is none, so that
+ * passthrough answers it as before (lstat(NULL): EFAULT) instead of crashing
+ */
+static int is_hidden_name(const char *path)
+{
+	const char *slash = path ? strrchr(path, '/') : NULL;
+
+	return slash && !strncmp(slash + 1, ".fuse_", 6);
+}
+
+/* a file named marker is in the directory of path */
+static int marked(const char *path, const char *marker)
+{
+	char buf[PATH_MAX];
+	const char *slash = path ? strrchr(path, '/') : NULL;
+
+	if (!slash)
+		return 0;
+	snprintf(buf, sizeof(buf), "%.*s/%s", (int) (slash - path), path, marker);
+	return access(buf, F_OK) == 0;
+}
+
+/* another client creates path: a file holding "third\n", if it is free */
+static void third_party_create(const char *path)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+
+	if (fd != -1) {
+		if (write(fd, "third\n", 6) != 6)
+			fprintf(stderr, "passthrough: short write to %s\n", path);
+		close(fd);
+	}
+}
+
+/* the first time only: marker.done is created in the directory of path */
+static int once(const char *path, const char *marker)
+{
+	char buf[PATH_MAX];
+	const char *slash = path ? strrchr(path, '/') : NULL;
+	int fd;
+
+	if (!slash || !marked(path, marker))
+		return 0;
+	snprintf(buf, sizeof(buf), "%.*s/%s.done", (int) (slash - path), path,
+		 marker);
+	fd = open(buf, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		return 0;
+	close(fd);
+	return 1;
+}
+
+/*
+ * - a source named *.exdev fails with EXDEV;
+ * - *.lost (flags 0) is renamed, then answers EIO (a lost reply);
+ * - *.taken: another client creates the target name, then EXDEV;
+ * - *.gone: another client removes the source and creates the target name,
+ *   then EIO (a failed rename that looks as if it happened);
+ * - a hidden source renamed to a visible name (a rename back) fails with EIO
+ *   with fail-restore in its directory; with race-create there, another
+ *   client creates the target name first (a create between a getattr and
+ *   the rename);
+ * - a hide (a hidden target): with hide-lost in the directory, renamed then
+ *   EIO; with hide-enoent, renamed then ENOENT (a resent rename whose first
+ *   one happened); with hide-eio, EIO and not renamed; with hidrace, another
+ *   process takes the hidden name first (once);
+ * - rename flags: EINVAL, but with noreplace in the directory
+ *   RENAME_NOREPLACE works, and with enosys any flag fails with ENOSYS; with
+ *   nr-race, another client creates the target name of a hide's source or
+ *   of a RENAME_NOREPLACE first (once).
+ */
 static int xmp_rename(const char *from, const char *to, unsigned int flags)
 {
 	int res;
 
+	if (ends_with(from, ".exdev"))
+		return -EXDEV;
+	if (ends_with(from, ".taken")) {
+		third_party_create(to);
+		return -EXDEV;
+	}
+	if (ends_with(from, ".gone")) {
+		unlink(from);
+		third_party_create(to);
+		return -EIO;
+	}
+	if (is_hidden_name(from) && !is_hidden_name(to) &&
+	    marked(from, "fail-restore"))
+		return -EIO;
+	if (is_hidden_name(to) && marked(to, "hide-eio"))
+		return -EIO;
+	if (is_hidden_name(to) && !is_hidden_name(from) &&
+	    once(to, "hidrace"))
+		third_party_create(to);
+	if (is_hidden_name(to) && !is_hidden_name(from) &&
+	    once(to, "nr-race"))
+		third_party_create(from);
+	if (flags && marked(to, "enosys"))
+		return -ENOSYS;
+#ifdef RENAME_NOREPLACE
+	if (flags == RENAME_NOREPLACE && marked(to, "noreplace")) {
+		if (!is_hidden_name(to) && once(to, "nr-race"))
+			third_party_create(to);
+		res = renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE);
+		return res == -1 ? -errno : 0;
+	}
+#endif
 	if (flags)
 		return -EINVAL;
+	if (is_hidden_name(from) && !is_hidden_name(to) &&
+	    marked(from, "race-create"))
+		third_party_create(to);
 
 	res = rename(from, to);
 	if (res == -1)
 		return -errno;
+	if (ends_with(from, ".lost"))
+		return -EIO;
+	if (is_hidden_name(to) && marked(to, "hide-lost"))
+		return -EIO;
+	if (is_hidden_name(to) && marked(to, "hide-enoent"))
+		return -ENOENT;
 
 	return 0;
 }
 
+/* a hidden source with race-create in its directory: as in xmp_rename */
 static int xmp_link(const char *from, const char *to)
 {
 	int res;
+
+	if (is_hidden_name(from) && !is_hidden_name(to) &&
+	    marked(from, "fail-restore"))
+		return -EIO;
+	if (is_hidden_name(from) && !is_hidden_name(to) &&
+	    marked(from, "race-create"))
+		third_party_create(to);
 
 	res = link(from, to);
 	if (res == -1)
@@ -314,6 +461,10 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 		fi->flags |= O_RDWR;
 	}
 #endif
+
+	/* slow-open in the directory: widen the window of an open */
+	if (marked(path, "slow-open"))
+		usleep(1000);
 
 	res = open(path, fi->flags);
 	if (res == -1)
